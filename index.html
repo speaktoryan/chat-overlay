@@ -1,0 +1,582 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>AWWC Chat Overlay</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link id="fontlink" rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@800&display=swap">
+<style>
+  :root { --size: 32px; --font: 'Nunito'; }
+  html, body {
+    margin: 0; padding: 0; height: 100%;
+    background: transparent !important;
+    overflow: hidden;
+  }
+  body {
+    font-family: var(--font), 'Noto Sans', system-ui, -apple-system, sans-serif;
+    font-weight: 800;
+    font-size: var(--size);
+    color: #fff;
+    -webkit-font-smoothing: antialiased;
+  }
+  /* Dark fade along the bottom edge (helps cover the PRISM Live logo) */
+  :root { --shade: 0; --shade-h: 40%; --shade-solid: 0%; --shade-side: 30%; }
+  #shade {
+    position: absolute; left: 0; right: 0; bottom: 0;
+    height: var(--shade-h);
+    pointer-events: none;
+    /* Fully solid at the bottom for --shade-solid, then fades upward */
+    background: linear-gradient(to top,
+      rgba(0,0,0,var(--shade)) 0%,
+      rgba(0,0,0,var(--shade)) var(--shade-solid),
+      rgba(0,0,0,calc(var(--shade) * .7)) calc(var(--shade-solid) + (100% - var(--shade-solid)) * .3),
+      rgba(0,0,0,calc(var(--shade) * .3)) calc(var(--shade-solid) + (100% - var(--shade-solid)) * .65),
+      rgba(0,0,0,0) 100%);
+  }
+  body.align-right .msg { text-align: right; }
+  body.align-center .msg { text-align: center; }
+
+  /* Soften the shade's side edge so it doesn't show a hard box line */
+  body.align-right #shade {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 var(--shade-side));
+            mask-image: linear-gradient(to right, transparent 0, #000 var(--shade-side));
+  }
+  body.align-left #shade {
+    -webkit-mask-image: linear-gradient(to left, transparent 0, #000 45%);
+            mask-image: linear-gradient(to left, transparent 0, #000 45%);
+  }
+  body.align-center #shade {
+    -webkit-mask-image: linear-gradient(to right, transparent 0, #000 30%, #000 70%, transparent 100%);
+            mask-image: linear-gradient(to right, transparent 0, #000 30%, #000 70%, transparent 100%);
+  }
+  /* Messages stack from the bottom; older ones get pushed off the top and fade out */
+  #chat {
+    position: absolute; inset: 0;
+    display: flex; flex-direction: column; justify-content: flex-end;
+    padding: 0.25em 0.4em;
+    box-sizing: border-box;
+    overflow: hidden;
+    -webkit-mask-image: linear-gradient(to bottom, transparent 0, #000 1.8em);
+            mask-image: linear-gradient(to bottom, transparent 0, #000 1.8em);
+  }
+  .msg {
+    flex: none;
+    margin-top: 0.45em;
+    line-height: 1.32;
+    overflow-wrap: anywhere;
+    word-break: break-word;
+    text-shadow:
+      0 0 2px rgba(0,0,0,.95),
+      0 0 2px rgba(0,0,0,.95),
+      0 1px 3px rgba(0,0,0,.9),
+      0 2px 8px rgba(0,0,0,.55);
+    animation: in .22s ease-out;
+    transition: opacity .6s ease;
+  }
+  .msg.out { opacity: 0; }
+  .name { margin-right: 0.3em; }
+  .amount { color: #ffd43b; margin-right: 0.3em; }
+  .event .text { font-style: italic; }
+  @keyframes in { from { opacity: 0; transform: translateY(0.35em); } to { opacity: 1; transform: none; } }
+
+  #status {
+    position: fixed; top: 6px; right: 8px;
+    font: 600 14px/1.3 system-ui, -apple-system, sans-serif;
+    color: #fff; background: rgba(0,0,0,.65);
+    padding: 3px 9px; border-radius: 6px;
+    display: none; max-width: 70%;
+  }
+  #status.err { background: rgba(170,20,20,.85); }
+</style>
+</head>
+<body>
+<div id="shade"></div>
+<div id="chat"></div>
+<div id="status"></div>
+
+<script>
+(() => {
+  'use strict';
+
+  // =====================================================================
+  //  YOUR SETTINGS — edit these lines on GitHub (pencil icon → edit → Commit).
+  //  Some apps (like PRISM) drop everything after "?" in a link, so the
+  //  settings live here instead of in the URL.
+  //
+  //  API key: paste your key WITHOUT its first 4 characters ("AIza").
+  //  Example: if your key is AIzaSyB123xyz, paste SyB123xyz below.
+  //  (Splitting it keeps GitHub's leaked-key scanner from flagging it.)
+  // =====================================================================
+  const SETTINGS = {
+    keyAfterAIza: 'PASTE_YOUR_KEY_HERE_WITHOUT_AIza',
+    size:   26,      // font size in px (was 32)
+    align:  'right', // 'left', 'right' or 'center'
+    shade:  1,       // bottom black fade strength: 0 = off, 1 = full black
+    shadeHeight: 30, // how tall the whole fade is, as % of the widget's height
+    shadeSolid:  30, // bottom part of the fade that's 100% solid black, as % of the fade's height
+    shadeSide:   30, // how quickly it darkens from the left edge (lower = darker sooner)
+    hide:   0,       // seconds before a message fades out (0 = never)
+    debug:  false,   // true = show a small status box (use for your first test)
+    // Only for UNLISTED test streams (public streams are found automatically).
+    // Paste the stream's link or video ID here; set back to '' when done.
+    testStream: '',
+  };
+  // =====================================================================
+
+  // URL settings still work where the app keeps them: ?param=value or #param=value
+  const Q = new URLSearchParams(location.search);
+  const H = new URLSearchParams(location.hash.replace(/^#/, ''));
+  const get = k => (Q.get(k) !== null ? Q.get(k) : H.get(k));
+  const has = k => Q.has(k) || H.has(k);
+  const builtInKey = /PASTE_YOUR_KEY/.test(SETTINGS.keyAfterAIza) || !SETTINGS.keyAfterAIza
+    ? '' : 'AIza' + SETTINGS.keyAfterAIza.trim().replace(/^AIza/, '');
+  const isDemoFile = /demo\.html?$/i.test(location.pathname);
+  // Accepts a bare ID or links like youtube.com/live/ID, youtube.com/watch?v=ID, youtu.be/ID
+  function videoIdFrom(s) {
+    s = (s || '').trim();
+    if (!s) return '';
+    const m = s.match(/(?:[?&]v=|\/live\/|youtu\.be\/|\/shorts\/|\/embed\/|\/video\/)([A-Za-z0-9_-]{11})/);
+    return m ? m[1] : (/^[A-Za-z0-9_-]{11}$/.test(s) ? s : '');
+  }
+
+  const CONFIG = {
+    key:       get('key') || builtInKey,                        // YouTube Data API key
+    handle:    get('handle') || '@AntiWizardWizardClub',        // channel to follow
+    // A ?handle= in the link means "test auto-find", so it ignores testStream
+    videoId:   videoIdFrom(get('v') || (has('handle') ? '' : SETTINGS.testStream)),
+    size:      Number(get('size')) || SETTINGS.size || 32,      // font size in px
+    font:      get('font') || 'Nunito',                         // any Google Font name
+    max:       Number(get('max')) || 60,                        // messages kept on screen
+    hideAfter: Number(get('hide')) || SETTINGS.hide || 0,       // seconds before a message fades (0 = never)
+    poll:      Math.max(5, Number(get('poll')) || 8),           // fallback polling interval, seconds
+    stall:     Math.max(20, Number(get('stall')) || 60),        // reconnect if stream is silent this long, seconds
+    debug:     has('debug') || SETTINGS.debug === true,
+    align:     get('align') || SETTINGS.align || 'left',
+    shade:     get('shade') !== null ? Number(get('shade')) : Number(SETTINGS.shade) || 0,
+    shadeH:    Number(get('shadeHeight')) || Number(SETTINGS.shadeHeight) || 40,
+    shadeSolid: get('shadeSolid') !== null ? Number(get('shadeSolid')) : Number(SETTINGS.shadeSolid) || 0,
+    shadeSide:  Number(get('shadeSide')) || Number(SETTINGS.shadeSide) || 30,
+    demo:      has('demo') || isDemoFile,
+  };
+
+  const API = 'https://www.googleapis.com/youtube/v3';
+  const STREAM_API = 'https://youtube.googleapis.com/youtube/v3/liveChat/messages/stream';
+
+  document.documentElement.style.setProperty('--size', CONFIG.size + 'px');
+  document.documentElement.style.setProperty('--shade', String(Math.min(1, Math.max(0, CONFIG.shade))));
+  document.documentElement.style.setProperty('--shade-h', Math.min(100, Math.max(0, CONFIG.shadeH)) + '%');
+  document.documentElement.style.setProperty('--shade-solid', Math.min(100, Math.max(0, CONFIG.shadeSolid)) + '%');
+  document.documentElement.style.setProperty('--shade-side', Math.min(100, Math.max(1, CONFIG.shadeSide)) + '%');
+  document.body.classList.add('align-' + CONFIG.align);
+  if (CONFIG.font !== 'Nunito') {
+    document.getElementById('fontlink').href =
+      'https://fonts.googleapis.com/css2?family=' + encodeURIComponent(CONFIG.font).replace(/%20/g, '+') +
+      ':wght@700;800;900&display=swap';
+  }
+  document.documentElement.style.setProperty('--font', "'" + CONFIG.font.replace(/'/g, '') + "'");
+
+  // ---------- Helpers ----------
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const statusEl = document.getElementById('status');
+  let statusTimer = null;
+  function status(text, isError = false, sticky = false) {
+    if (CONFIG.debug) console.log('[overlay]', text);
+    if (!CONFIG.debug && !isError) { statusEl.style.display = 'none'; return; }
+    statusEl.textContent = text;
+    statusEl.className = isError ? 'err' : '';
+    statusEl.style.display = 'block';
+    clearTimeout(statusTimer);
+    if (isError && !sticky && !CONFIG.debug) {
+      statusTimer = setTimeout(() => { statusEl.style.display = 'none'; }, 8000);
+    }
+  }
+  function clearStatus() { if (!CONFIG.debug) statusEl.style.display = 'none'; }
+
+  // Same person -> same color, every message, every stream (hash of their channel ID)
+  const COLORS = [
+    '#ff5ec4', '#b68cff', '#ffa94d', '#ff6b6b', '#7ee26b', '#4fd8ff',
+    '#ffe066', '#ff8fab', '#63e6be', '#74c0fc', '#f783ac', '#c0eb75',
+    '#ffc078', '#9775fa', '#3bc9db', '#ff922b'
+  ];
+  function colorFor(id) {
+    let h = 2166136261;
+    for (let i = 0; i < id.length; i++) { h ^= id.charCodeAt(i); h = Math.imul(h, 16777619); }
+    return COLORS[(h >>> 0) % COLORS.length];
+  }
+
+  // Normalizes "TEXT_MESSAGE_EVENT" -> "textMessageEvent" in case the stream uses enum names
+  function normType(t) {
+    if (!t) return '';
+    if (!/^[A-Z_]+$/.test(t)) return t;
+    return t.toLowerCase().replace(/_([a-z])/g, (_, c) => c.toUpperCase());
+  }
+
+  // ---------- Rendering ----------
+  const chat = document.getElementById('chat');
+  const seen = new Set();
+
+  function remember(id) {
+    seen.add(id);
+    if (seen.size > 5000) { const first = seen.values().next().value; seen.delete(first); }
+  }
+
+  function addMessage(m) {
+    if (!m || !m.id) return;
+    const s = m.snippet || {};
+    const a = m.authorDetails || {};
+    const type = normType(s.type);
+
+    if (type === 'messageDeletedEvent' || type === 'tombstone') {
+      const del = (s.messageDeletedDetails && s.messageDeletedDetails.deletedMessageId) || (type === 'tombstone' ? m.id : null);
+      if (del) chat.querySelectorAll('[data-id="' + CSS.escape(del) + '"]').forEach(n => n.remove());
+      return;
+    }
+    if (type === 'userBannedEvent') {
+      const d = s.userBannedDetails && s.userBannedDetails.bannedUserDetails;
+      if (d && d.channelId) chat.querySelectorAll('[data-author="' + CSS.escape(d.channelId) + '"]').forEach(n => n.remove());
+      return;
+    }
+    if (seen.has(m.id)) return;
+    remember(m.id);
+
+    let text = '', amount = '', isEvent = false;
+    switch (type) {
+      case 'textMessageEvent':
+        text = (s.textMessageDetails && s.textMessageDetails.messageText) || s.displayMessage || '';
+        break;
+      case 'superChatEvent':
+        amount = (s.superChatDetails && s.superChatDetails.amountDisplayString) || '';
+        text = (s.superChatDetails && s.superChatDetails.userComment) || '';
+        break;
+      case 'superStickerEvent':
+        amount = (s.superStickerDetails && s.superStickerDetails.amountDisplayString) || '';
+        text = 'sent a Super Sticker';
+        isEvent = true;
+        break;
+      case 'memberMilestoneChatEvent':
+        text = (s.memberMilestoneChatDetails && s.memberMilestoneChatDetails.userComment) || s.displayMessage || '';
+        break;
+      case 'chatEndedEvent':
+      case 'pollEvent':
+        return;
+      default:
+        if (!s.displayMessage || s.hasDisplayContent === false) return;
+        text = s.displayMessage;
+        isEvent = true;
+    }
+    if (!text && !amount) return;
+
+    const author = a.channelId || s.authorChannelId || a.displayName || '?';
+    const el = document.createElement('div');
+    el.className = 'msg' + (isEvent ? ' event' : '');
+    el.dataset.id = m.id;
+    el.dataset.author = author;
+
+    const name = document.createElement('span');
+    name.className = 'name';
+    name.textContent = a.displayName || '';
+    name.style.color = colorFor(author);
+    el.appendChild(name);
+
+    if (amount) {
+      const amt = document.createElement('span');
+      amt.className = 'amount';
+      amt.textContent = amount;
+      el.appendChild(amt);
+    }
+    const body = document.createElement('span');
+    body.className = 'text';
+    body.textContent = text;
+    el.appendChild(body);
+
+    chat.appendChild(el);
+    while (chat.children.length > CONFIG.max) chat.firstElementChild.remove();
+
+    if (CONFIG.hideAfter > 0) {
+      setTimeout(() => {
+        el.classList.add('out');
+        setTimeout(() => el.remove(), 700);
+      }, CONFIG.hideAfter * 1000);
+    }
+  }
+
+  // ---------- YouTube API ----------
+  function apiError(status, j) {
+    const err = (j && j.error) || {};
+    const e = new Error(err.message || ('HTTP ' + status));
+    e.status = status;
+    e.reason = (err.errors && err.errors[0] && err.errors[0].reason) || err.status || '';
+    return e;
+  }
+
+  async function api(path, params, timeoutMs = 15000) {
+    const u = new URL(API + path);
+    for (const [k, v] of Object.entries(params)) if (v != null) u.searchParams.set(k, v);
+    u.searchParams.set('key', CONFIG.key);
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), timeoutMs);
+    try {
+      const r = await fetch(u, { signal: ctrl.signal, cache: 'no-store' });
+      const j = await r.json().catch(() => ({}));
+      if (!r.ok) throw apiError(r.status, j);
+      return j;
+    } finally { clearTimeout(t); }
+  }
+
+  let uploadsId = null, channelId = null, lookups = 0, searchesLeft = 40;
+
+  async function liveChatForVideos(ids) {
+    ids = ids.filter(Boolean);
+    if (!ids.length) return null;
+    const j = await api('/videos', { part: 'snippet,liveStreamingDetails', id: ids.join(',') });
+    const vids = j.items || [];
+    const pick = st => vids.find(v => v.snippet && v.snippet.liveBroadcastContent === st &&
+                                      v.liveStreamingDetails && v.liveStreamingDetails.activeLiveChatId);
+    const v = pick('live') || pick('upcoming');
+    return v ? { videoId: v.id, chatId: v.liveStreamingDetails.activeLiveChatId } : null;
+  }
+
+  async function findLiveChat() {
+    if (CONFIG.videoId) return liveChatForVideos([CONFIG.videoId]);
+    if (!uploadsId) {
+      const handle = CONFIG.handle.startsWith('@') ? CONFIG.handle : '@' + CONFIG.handle;
+      const j = await api('/channels', { part: 'contentDetails', forHandle: handle });
+      const ch = j.items && j.items[0];
+      if (!ch) { const e = new Error('Channel not found: ' + handle); e.fatal = true; throw e; }
+      channelId = ch.id;
+      uploadsId = ch.contentDetails.relatedPlaylists.uploads;
+    }
+    lookups++;
+    // Cheap check (2 quota units): newest uploads, which include live streams
+    const pl = await api('/playlistItems', { part: 'contentDetails', playlistId: uploadsId, maxResults: 10 });
+    let found = await liveChatForVideos((pl.items || []).map(i => i.contentDetails && i.contentDetails.videoId));
+    // Backup check every ~2 minutes in case the stream hasn't reached the uploads list yet
+    if (!found && searchesLeft > 0 && lookups % 6 === 0) {
+      searchesLeft--;
+      const s = await api('/search', { part: 'id', channelId, eventType: 'live', type: 'video', maxResults: 5 });
+      found = await liveChatForVideos((s.items || []).map(i => i.id && i.id.videoId));
+    }
+    return found;
+  }
+
+  // Pulls complete top-level JSON objects out of a text stream.
+  // Works whether the server streams a JSON array ("[{...},{...}]") or SSE ("data: {...}").
+  function makeObjectParser() {
+    let buf = '', depth = 0, inStr = false, esc = false, start = -1;
+    return function push(chunk) {
+      const out = [];
+      const base = buf.length;
+      buf += chunk;
+      for (let i = base; i < buf.length; i++) {
+        const c = buf[i];
+        if (inStr) {
+          if (esc) esc = false;
+          else if (c === '\\') esc = true;
+          else if (c === '"') inStr = false;
+          continue;
+        }
+        if (c === '"') { if (depth > 0) inStr = true; continue; }
+        if (c === '{') { if (depth === 0) start = i; depth++; }
+        else if (c === '}' && depth > 0) {
+          depth--;
+          if (depth === 0) {
+            try { out.push(JSON.parse(buf.slice(start, i + 1))); } catch (_) {}
+            buf = buf.slice(i + 1); i = -1; start = -1;
+          }
+        }
+      }
+      if (depth === 0) buf = '';
+      return out;
+    };
+  }
+
+  let streamWorks = null;   // null = unknown, true = confirmed, false = use polling
+  let streamFails = 0;
+  let activeCtrl = null;
+
+  function handleResponse(obj, state, fromStream) {
+    if (obj.error) throw apiError(obj.error.code || 500, obj);
+    if (Array.isArray(obj.items)) obj.items.forEach(addMessage);
+    if (obj.nextPageToken) state.pageToken = obj.nextPageToken;
+    if (obj.offlineAt) state.ended = true;
+    if (fromStream && (obj.kind || obj.items)) { streamWorks = true; streamFails = 0; }
+  }
+
+  async function streamOnce(chatId, state) {
+    const u = new URL(STREAM_API);
+    u.searchParams.set('liveChatId', chatId);
+    u.searchParams.set('part', 'snippet,authorDetails');
+    u.searchParams.set('key', CONFIG.key);
+    if (state.pageToken) u.searchParams.set('pageToken', state.pageToken);
+
+    const ctrl = new AbortController();
+    activeCtrl = ctrl;
+    let lastData = Date.now();
+    const watchdog = setInterval(() => {
+      if (Date.now() - lastData > CONFIG.stall * 1000) ctrl.abort();
+    }, 5000);
+    try {
+      const r = await fetch(u, { signal: ctrl.signal, cache: 'no-store' });
+      if (!r.ok) {
+        const j = await r.json().catch(() => ({}));
+        throw apiError(r.status, j);
+      }
+      if (!r.body || !r.body.getReader) { const e = new Error('No streaming support'); e.noStream = true; throw e; }
+      status('Connected (live stream mode)');
+      clearStatus();
+      const reader = r.body.getReader();
+      const dec = new TextDecoder();
+      const parse = makeObjectParser();
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        lastData = Date.now();
+        for (const obj of parse(dec.decode(value, { stream: true }))) handleResponse(obj, state, true);
+        if (state.ended) { try { ctrl.abort(); } catch (_) {} break; }
+      }
+    } finally {
+      clearInterval(watchdog);
+      if (activeCtrl === ctrl) activeCtrl = null;
+    }
+  }
+
+  async function pollOnce(chatId, state) {
+    const j = await api('/liveChat/messages', {
+      liveChatId: chatId, part: 'snippet,authorDetails', maxResults: 200,
+      pageToken: state.pageToken || null
+    });
+    handleResponse(j, state, false);
+    return Math.max(j.pollingIntervalMillis || 0, CONFIG.poll * 1000);
+  }
+
+  const CHAT_GONE = new Set(['liveChatEnded', 'liveChatNotFound', 'liveChatDisabled']);
+  const QUOTA = new Set(['quotaExceeded', 'dailyLimitExceeded']);
+
+  async function followChat(chatId) {
+    const state = { pageToken: null, ended: false };
+    let backoff = 0;
+    for (;;) {
+      const started = Date.now();
+      try {
+        if (streamWorks !== false) {
+          await streamOnce(chatId, state);
+        } else {
+          const wait = await pollOnce(chatId, state);
+          if (state.ended) return;
+          clearStatus();
+          backoff = 0;
+          await sleep(wait);
+          continue;
+        }
+        if (state.ended) return;
+        backoff = 0;
+      } catch (e) {
+        if (state.ended) return;
+        if (CHAT_GONE.has(e.reason)) return;
+        if (QUOTA.has(e.reason)) {
+          status('YouTube API daily quota used up — resets at midnight Pacific', true, true);
+          await sleep(10 * 60 * 1000);
+          continue;
+        }
+        if ((e.status === 400 || e.status === 403) && /api key|referer|referrer|blocked/i.test(e.message + ' ' + e.reason)) {
+          status('API key problem: ' + e.message, true, true);
+          await sleep(60 * 1000);
+          continue;
+        }
+        if (e.name === 'AbortError') {
+          status('Stream quiet or stalled — reconnecting');
+        } else {
+          // Never got data from the streaming endpoint? After 2 tries, switch to polling.
+          if (streamWorks !== true && streamWorks !== false) {
+            streamFails++;
+            if (streamFails >= 2) { streamWorks = false; status('Streaming unavailable — using polling'); continue; }
+          }
+          if (e.reason === 'rateLimitExceeded') { await sleep(5000); continue; }
+          status('Connection problem (' + (e.reason || e.message) + ') — retrying', true);
+          backoff = Math.min(backoff + 1, 5);
+          await sleep(1000 * Math.pow(2, backoff));
+          continue;
+        }
+      }
+      // Protect quota: never open stream connections faster than every 3 seconds
+      const dur = Date.now() - started;
+      if (dur < 3000) await sleep(3000 - dur);
+    }
+  }
+
+  // Reconnect right away when the phone's network comes back or the page is shown again
+  window.addEventListener('online', () => { if (activeCtrl) activeCtrl.abort(); });
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible' && activeCtrl) activeCtrl.abort();
+  });
+
+  async function run() {
+    if (!CONFIG.key) {
+      status('No API key yet — add it in the SETTINGS block of index.html. (Page received: ' +
+             location.href.replace(/key=[^&#]*/, 'key=…') + ')', true, true);
+      return;
+    }
+    for (;;) {
+      let live = null;
+      try {
+        live = await findLiveChat();
+      } catch (e) {
+        if (e.fatal) { status(e.message, true, true); return; }
+        if (QUOTA.has(e.reason)) { status('YouTube API daily quota used up — resets at midnight Pacific', true, true); await sleep(10 * 60 * 1000); continue; }
+        status('Lookup problem: ' + (e.reason || e.message), true);
+        await sleep(30000);
+        continue;
+      }
+      if (!live) {
+        status(CONFIG.videoId
+          ? 'Video ' + CONFIG.videoId + ' is not live (or has no live chat) — checking again…'
+          : 'Waiting for ' + CONFIG.handle + ' to go live… (unlisted streams: use testStream in SETTINGS)');
+        await sleep(20000);
+        continue;
+      }
+      status('Found live video ' + live.videoId);
+      await followChat(live.chatId);
+      status('Chat ended — waiting for the next stream…');
+      await sleep(15000);
+    }
+  }
+
+  // ---------- Demo mode (?demo) for previewing the look without going live ----------
+  function runDemo() {
+    const users = [
+      ['UC1', '@BladerOTeamORDINARY'], ['UC2', '@fatimahassan3723'], ['UC3', '@GilbertHoefler-t6d1x'],
+      ['UC4', '@LRdrum21'], ['UC5', '@AntiWizardWizardClub'], ['UC6', '@spinfinity_x'], ['UC7', '@cowlsphinxfan']
+    ];
+    const lines = [
+      'wizard rod is gonna take this whole thing', 'there\'s a 8-90?', 'All the goats came out tonite 😭',
+      'I so want that Scythe Incendio V2', 'Tsukairaaaa', 'yeah the one from cowl sphinx',
+      'trust me tilt silver wolf a bit and put it on 8-90 glide', 'gotta have a bey break lol',
+      'that launch was CLEAN', 'xtreme finish!!', 'who\'s up next?', 'LETS GOOO 🔥🔥'
+    ];
+    let n = 0;
+    status('Demo mode');
+    const tick = () => {
+      const [cid, name] = users[Math.floor(Math.random() * users.length)];
+      const sc = Math.random() < 0.06;
+      addMessage({
+        id: 'demo' + (n++),
+        snippet: sc
+          ? { type: 'superChatEvent', superChatDetails: { amountDisplayString: '$5.00', userComment: 'GG everyone!' } }
+          : { type: 'textMessageEvent', textMessageDetails: { messageText: lines[Math.floor(Math.random() * lines.length)] } },
+        authorDetails: { channelId: cid, displayName: name }
+      });
+      setTimeout(tick, 700 + Math.random() * 1800);
+    };
+    tick();
+  }
+
+  // Exposed for testing
+  window.__overlay = { makeObjectParser, colorFor, normType };
+
+  if (CONFIG.demo) runDemo(); else run();
+})();
+</script>
+</body>
+</html>
