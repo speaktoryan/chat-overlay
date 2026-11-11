@@ -110,7 +110,7 @@
   //  (Splitting it keeps GitHub's leaked-key scanner from flagging it.)
   // =====================================================================
   const SETTINGS = {
-    keyAfterAIza: 'SyDW4FnveaaubnGEK-kmO2JHpWXc3rDemYM',
+    keyAfterAIza: 'PASTE_YOUR_KEY_HERE_WITHOUT_AIza',
     size:   26,      // font size in px (was 32)
     align:  'right', // 'left', 'right' or 'center'
     shade:  1,       // bottom black fade strength: 0 = off, 1 = full black
@@ -122,6 +122,9 @@
     // Only for UNLISTED test streams (public streams are found automatically).
     // Paste the stream's link or video ID here; set back to '' when done.
     testStream: '',
+    // Longest stream you'll run, in hours. YouTube gives the key a fixed daily
+    // allowance; the widget paces its chat checks so it lasts this long.
+    streamHours: 12,
   };
   // =====================================================================
 
@@ -153,6 +156,7 @@
     poll:      Math.max(5, Number(get('poll')) || 8),           // fallback polling interval, seconds
     stall:     Math.max(20, Number(get('stall')) || 60),        // reconnect if stream is silent this long, seconds
     debug:     has('debug') || SETTINGS.debug === true,
+    hours:     Math.max(1, Number(get('hours')) || Number(SETTINGS.streamHours) || 12),
     align:     get('align') || SETTINGS.align || 'left',
     shade:     get('shade') !== null ? Number(get('shade')) : Number(SETTINGS.shade) || 0,
     shadeH:    Number(get('shadeHeight')) || Number(SETTINGS.shadeHeight) || 40,
@@ -163,6 +167,47 @@
 
   const API = 'https://www.googleapis.com/youtube/v3';
   const STREAM_API = 'https://youtube.googleapis.com/youtube/v3/liveChat/messages/stream';
+
+  // ---------- Daily allowance budget ----------
+  // YouTube gives each key 10,000 units a day (resets midnight Pacific). A chat check
+  // costs 5 units, a lookup 1. This spreads 9,000 of them evenly over CONFIG.hours
+  // (1,000 held back for testing and finding the stream). Quiet stretches save up
+  // credit so busy stretches can check faster for a while.
+  const DAILY_UNITS = 10000, RESERVE_UNITS = 1000;
+  const budget = {
+    rate: (DAILY_UNITS - RESERVE_UNITS) / (CONFIG.hours * 3600000),   // units per ms
+    cap: 300, units: 150, last: Date.now(), spent: 0,
+  };
+  // Remember the budget across reloads of the widget on the same (Pacific) day
+  const BUDGET_KEY = 'awwc-yt-budget';
+  const pacificDay = () => new Date().toLocaleDateString('en-US', { timeZone: 'America/Los_Angeles' });
+  try {
+    const saved = JSON.parse(localStorage.getItem(BUDGET_KEY) || 'null');
+    if (saved && saved.day === pacificDay() && saved.rate === budget.rate) {
+      budget.units = Math.min(budget.cap, saved.units); budget.last = saved.last; budget.spent = saved.spent || 0;
+    }
+  } catch (_) {}
+  function saveBudget() {
+    try { localStorage.setItem(BUDGET_KEY, JSON.stringify({ day: pacificDay(), rate: budget.rate, units: budget.units, last: budget.last, spent: budget.spent })); } catch (_) {}
+  }
+  function refill() {
+    const now = Date.now();
+    budget.units = Math.min(budget.cap, budget.units + (now - budget.last) * budget.rate);
+    budget.last = now;
+  }
+  async function spend(cost) {
+    refill();
+    if (budget.units < cost) {
+      const wait = (cost - budget.units) / budget.rate;
+      if (CONFIG.debug) status('Pacing YouTube checks to last ' + CONFIG.hours + 'h (next in ' + Math.ceil(wait / 1000) + 's)');
+      await sleep(wait);
+      refill();
+    }
+    budget.units -= cost;
+    budget.spent += cost;
+    saveBudget();
+  }
+  const unitsPerHour = Math.round((DAILY_UNITS - RESERVE_UNITS) / CONFIG.hours);
 
   document.documentElement.style.setProperty('--size', CONFIG.size + 'px');
   document.documentElement.style.setProperty('--shade', String(Math.min(1, Math.max(0, CONFIG.shade))));
@@ -312,6 +357,7 @@
   }
 
   async function api(path, params, timeoutMs = 15000) {
+    if (path !== '/search') await spend(path === '/liveChat/messages' ? 5 : 1);
     const u = new URL(API + path);
     for (const [k, v] of Object.entries(params)) if (v != null) u.searchParams.set(k, v);
     u.searchParams.set('key', CONFIG.key);
@@ -353,7 +399,7 @@
     const pl = await api('/playlistItems', { part: 'contentDetails', playlistId: uploadsId, maxResults: 10 });
     let found = await liveChatForVideos((pl.items || []).map(i => i.contentDetails && i.contentDetails.videoId));
     // Backup check every ~2 minutes in case the stream hasn't reached the uploads list yet
-    if (!found && searchesLeft > 0 && lookups % 6 === 0) {
+    if (!found && searchesLeft > 0 && lookups % 4 === 0) {
       searchesLeft--;
       const s = await api('/search', { part: 'id', channelId, eventType: 'live', type: 'video', maxResults: 5 });
       found = await liveChatForVideos((s.items || []).map(i => i.id && i.id.videoId));
@@ -392,13 +438,14 @@
     };
   }
 
+  let lastChatAt = 0;       // when the last new chat message arrived
   let streamWorks = null;   // null = unknown, true = confirmed, false = use polling
   let streamFails = 0;
   let activeCtrl = null;
 
   function handleResponse(obj, state, fromStream) {
     if (obj.error) throw apiError(obj.error.code || 500, obj);
-    if (Array.isArray(obj.items)) obj.items.forEach(addMessage);
+    if (Array.isArray(obj.items)) { obj.items.forEach(addMessage); if (obj.items.length) lastChatAt = Date.now(); }
     if (obj.nextPageToken) state.pageToken = obj.nextPageToken;
     if (obj.offlineAt) state.ended = true;
     if (fromStream && (obj.kind || obj.items)) { streamWorks = true; streamFails = 0; }
@@ -411,6 +458,7 @@
     u.searchParams.set('key', CONFIG.key);
     if (state.pageToken) u.searchParams.set('pageToken', state.pageToken);
 
+    await spend(5);
     const ctrl = new AbortController();
     activeCtrl = ctrl;
     let lastData = Date.now();
@@ -424,7 +472,7 @@
         throw apiError(r.status, j);
       }
       if (!r.body || !r.body.getReader) { const e = new Error('No streaming support'); e.noStream = true; throw e; }
-      status('Connected (live stream mode)');
+      status('Connected (live stream mode) · budget ' + unitsPerHour + ' units/h for ' + CONFIG.hours + 'h · used ' + budget.spent);
       clearStatus();
       const reader = r.body.getReader();
       const dec = new TextDecoder();
@@ -448,7 +496,9 @@
       pageToken: state.pageToken || null
     });
     handleResponse(j, state, false);
-    return Math.max(j.pollingIntervalMillis || 0, CONFIG.poll * 1000);
+    const quiet = Date.now() - lastChatAt > 120000;      // no new chat for 2 minutes
+    if (CONFIG.debug) status('Connected (polling' + (quiet ? ', chat quiet' : '') + ') · budget ' + unitsPerHour + ' units/h for ' + CONFIG.hours + 'h · used ' + budget.spent);
+    return Math.max(j.pollingIntervalMillis || 0, (quiet ? 30 : CONFIG.poll) * 1000);
   }
 
   const CHAT_GONE = new Set(['liveChatEnded', 'liveChatNotFound', 'liveChatDisabled']);
@@ -533,7 +583,7 @@
         status(CONFIG.videoId
           ? 'Video ' + CONFIG.videoId + ' is not live (or has no live chat) — checking again…'
           : 'Waiting for ' + CONFIG.handle + ' to go live… (unlisted streams: use testStream in SETTINGS)');
-        await sleep(20000);
+        await sleep(30000);
         continue;
       }
       status('Found live video ' + live.videoId);
@@ -573,7 +623,7 @@
   }
 
   // Exposed for testing
-  window.__overlay = { makeObjectParser, colorFor, normType };
+  window.__overlay = { makeObjectParser, colorFor, normType, budget };
 
   if (CONFIG.demo) runDemo(); else run();
 })();
